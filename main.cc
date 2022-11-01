@@ -1,211 +1,77 @@
 #include <GL/glew.h>
+#define GLFW_INCLUDE_GLU
 #include <GLFW/glfw3.h>
 
+#include <cassert>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <string>
+#include <vector>
 
 #include "tiny_gltf.h"
 
 #define BUFFER_OFFSET(i) ((char *)NULL + (i))
 
-static void
-drawMesh(tinygltf::Model &model, const tinygltf::Mesh &mesh,
-    std::map<int, GLuint> &bufferViewMap,
-    std::map<std::string, int> &attributeLocationMap)
+#define CAM_Z (3.0f)
+int width = 768;
+int height = 768;
+
+double prevMouseX, prevMouseY;
+bool mouseLeftPressed;
+bool mouseRightPressed;
+float eye[3], lookat[3], up[3];
+
+GLFWwindow *window;
+
+typedef struct {
+  GLuint vb;
+} GLBufferState;
+
+typedef struct {
+  std::map<std::string, GLint> attribs;
+  std::map<std::string, GLint> uniforms;
+} GLProgramState;
+
+std::map<int, GLBufferState> glBufferState;
+GLProgramState glProgramState;
+
+void
+checkErrors(std::string desc)
 {
-  // isCurvesLoc
-
-  for (auto primitive : mesh.primitives) {
-    if (primitive.indices < 0) return;
-
-    for (auto [attribute, accessorIndex] : primitive.attributes) {
-      assert(accessorIndex >= 0);
-      const tinygltf::Accessor &accessor = model.accessors[accessorIndex];
-
-      glBindBuffer(GL_ARRAY_BUFFER, bufferViewMap[accessor.bufferView]);
-
-      int size = -1;
-      if (accessor.type == TINYGLTF_TYPE_SCALAR) {
-        size = 1;
-      } else if (accessor.type == TINYGLTF_TYPE_VEC2) {
-        size = 2;
-      } else if (accessor.type == TINYGLTF_TYPE_VEC3) {
-        size = 3;
-      } else if (accessor.type == TINYGLTF_TYPE_VEC4) {
-        size = 4;
-      } else {
-        assert(0);
-      }
-
-      if (attribute == "POSITION" || attribute == "NORMAL" ||
-          attribute == "TEXCOORD_0") {
-        if (attributeLocationMap[attribute] < 0) continue;
-
-        int byteStride =
-            accessor.ByteStride(model.bufferViews[accessor.bufferView]);
-        assert(byteStride != -1);
-
-        glVertexAttribPointer(attributeLocationMap[attribute], size,
-            accessor.componentType, accessor.normalized ? GL_TRUE : GL_FALSE,
-            byteStride, BUFFER_OFFSET(accessor.byteOffset));
-        glEnableVertexAttribArray(attributeLocationMap[attribute]);
-      }
-    }
-
-    const tinygltf::Accessor &accessor = model.accessors[primitive.indices];
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, bufferViewMap[accessor.bufferView]);
-
-    int mode = -1;
-    switch (primitive.mode) {
-      case TINYGLTF_MODE_TRIANGLES:
-        mode = GL_TRIANGLES;
-        break;
-      case TINYGLTF_MODE_TRIANGLE_STRIP:
-        mode = GL_TRIANGLE_STRIP;
-        break;
-      case TINYGLTF_MODE_TRIANGLE_FAN:
-        mode = GL_TRIANGLE_FAN;
-        break;
-      case TINYGLTF_MODE_POINTS:
-        mode = GL_POINTS;
-        break;
-      case TINYGLTF_MODE_LINE:
-        mode = GL_LINES;
-        break;
-      case TINYGLTF_MODE_LINE_LOOP:
-        mode = GL_LINE_LOOP;
-        break;
-      default:
-        assert(0);
-        break;
-    }
-    glDrawElements(mode, accessor.count, accessor.componentType,
-        BUFFER_OFFSET(accessor.byteOffset));
-
-    {
-      for (auto [attribute, _] : primitive.attributes) {
-        if (attribute == "POSITION" || attribute == "NORMAL" ||
-            attribute == "TEXCOORD_0") {
-          if (attributeLocationMap[attribute] < 0) continue;
-
-          glDisableVertexAttribArray(attributeLocationMap[attribute]);
-        }
-      }
-    }
+  GLenum e = glGetError();
+  if (e != GL_NO_ERROR) {
+    fprintf(stderr, "OpenGL error in \"%s\": %d (%d)\n", desc.c_str(), e, e);
+    exit(EXIT_FAILURE);
   }
 }
 
-static void
-drawNode(tinygltf::Model &model, const tinygltf::Node &node,
-    std::map<int, GLuint> &bufferViewMap,
-    std::map<std::string, int> &attributeLocationMap)
+static std::string
+GetFilePathExtension(const std::string &FileName)
 {
-  // glPushMtrix();
-  glPushMatrix();
-  if (node.matrix.size() == 16) {
-    glMultMatrixd(node.matrix.data());
-  } else {
-    // TODO: support matrix: whose size is not 16
-  }
-
-  if (node.mesh > -1) {
-    assert(node.mesh < model.meshes.size());
-    drawMesh(
-        model, model.meshes[node.mesh], bufferViewMap, attributeLocationMap);
-  }
-
-  for (auto nodeIndex : node.children) {
-    drawNode(
-        model, model.nodes[nodeIndex], bufferViewMap, attributeLocationMap);
-  }
-
-  glPopMatrix();
+  if (FileName.find_last_of(".") != std::string::npos)
+    return FileName.substr(FileName.find_last_of(".") + 1);
+  return "";
 }
 
-static void
-drawModel(tinygltf::Model &model, std::map<int, GLuint> &bufferViewMap,
-    std::map<std::string, int> &attributeLocationMap)
-{
-  assert(model.scenes.size() > 0);
-
-  int defaultSceneIndex = model.defaultScene > -1 ? model.defaultScene : 0;
-  const tinygltf::Scene &scene = model.scenes[defaultSceneIndex];
-  for (auto nodeIndex : scene.nodes) {
-    drawNode(
-        model, model.nodes[nodeIndex], bufferViewMap, attributeLocationMap);
-  }
-}
-
-static bool
-setupBuffers(tinygltf::Model &model, GLuint programId,
-    std::map<int, GLuint> &bufferViewMap,
-    std::map<std::string, int> &attributeLocationMap)
-{
-  for (size_t i = 0; i < model.bufferViews.size(); i++) {
-    auto &bufferView = model.bufferViews[i];
-    if (bufferView.target == 0) {
-      std::cout << "[WARN] bufferView.target is zero" << std::endl;
-      continue;
-    }
-
-    int sparse_accessor = -1;
-    for (size_t a_i = 0; a_i < model.accessors.size(); ++a_i) {
-      auto &accessor = model.accessors[a_i];
-      if (accessor.bufferView == i) {
-        std::cout << i << " is used by accessor " << a_i << std::endl;
-        if (accessor.sparse.isSparse) {
-          std::cout
-              << "[WARN]: this bufferView has at least one sparse accessor."
-              << std::endl;
-          sparse_accessor = a_i;
-          break;
-        }
-      }
-    }
-
-    const tinygltf::Buffer &buffer = model.buffers[bufferView.buffer];
-    glGenBuffers(1, &bufferViewMap[i]);  // bufferViewを1個つくる
-    glBindBuffer(bufferView.target, bufferViewMap[i]);
-    std::cout << "buffer.size= " << buffer.data.size()
-              << ", byteOffset = " << bufferView.byteOffset << std::endl;
-
-    if (sparse_accessor < 0) {
-      glBufferData(bufferView.target, bufferView.byteLength,
-          &buffer.data.at(0) + bufferView.byteOffset, GL_STATIC_DRAW);
-      glBindBuffer(bufferView.target, 0);
-    } else {
-      std::cerr << "[ERROR]: Sparse accessor support is TODO." << std::endl;
-      return false;
-      // TODO: support sparse accessor
-    }
-  }
-
-  // TODO: Implement texture
-
-  // これ何に使う？
-  glUseProgram(programId);
-  attributeLocationMap["POSITION"] =
-      glGetAttribLocation(programId, "in_vertex");
-  attributeLocationMap["NORMAL"] = glGetAttribLocation(programId, "in_normal");
-  attributeLocationMap["TEXCOORD_0"] =
-      glGetAttribLocation(programId, "in_texcoord");
-  // GLint glGetAttribLocation
-
-  return true;
-}
-
-static bool
-loadShader(GLenum shaderType, GLuint &shader, const char *shaderFilename)
+bool
+LoadShader(GLenum shaderType,  // GL_VERTEX_SHADER or GL_FRAGMENT_SHADER(or
+                               // maybe GL_COMPUTE_SHADER)
+    GLuint &shader, const char *shaderSourceFilename)
 {
   GLint val = 0;
+
+  // free old shader/program
   if (shader != 0) {
     glDeleteShader(shader);
   }
 
   std::vector<GLchar> srcbuf;
-  FILE *fp = fopen(shaderFilename, "rb");
+  FILE *fp = fopen(shaderSourceFilename, "rb");
   if (!fp) {
-    std::cerr << "Failed to load shader: " << shaderFilename << std::endl;
+    fprintf(stderr, "failed to load shader: %s\n", shaderSourceFilename);
     return false;
   }
   fseek(fp, 0, SEEK_END);
@@ -225,133 +91,454 @@ loadShader(GLenum shaderType, GLuint &shader, const char *shaderFilename)
   glGetShaderiv(shader, GL_COMPILE_STATUS, &val);
   if (val != GL_TRUE) {
     char log[4096];
-    GLsizei message_len;
-    glGetShaderInfoLog(shader, 4096, &message_len, log);
-    std::cerr << log << std::endl;
-    std::cerr << "[ERROR] " << shaderFilename << std::endl;
+    GLsizei msglen;
+    glGetShaderInfoLog(shader, 4096, &msglen, log);
+    printf("%s\n", log);
+    // assert(val == GL_TRUE && "failed to compile shader");
+    printf(
+        "ERR: Failed to load or compile shader [ %s ]\n", shaderSourceFilename);
     return false;
   }
 
-  std::cout << "Loaded shader " << shaderFilename << " OK" << std::endl;
+  printf("Load shader [ %s ] OK\n", shaderSourceFilename);
   return true;
 }
 
-static bool
-linkShader(GLuint &programId, GLuint &vertexShader, GLuint &fragmentShader)
+bool
+LinkShader(GLuint &prog, GLuint &vertShader, GLuint &fragShader)
 {
   GLint val = 0;
 
-  if (programId != 0) {
-    glDeleteProgram(programId);
+  if (prog != 0) {
+    glDeleteProgram(prog);
   }
 
-  programId = glCreateProgram();
+  prog = glCreateProgram();
 
-  glAttachShader(programId, vertexShader);
-  glAttachShader(programId, fragmentShader);
-  glLinkProgram(programId);
+  glAttachShader(prog, vertShader);
+  glAttachShader(prog, fragShader);
+  glLinkProgram(prog);
 
-  glGetProgramiv(programId, GL_LINK_STATUS, &val);
-  assert(val == GL_TRUE);
+  glGetProgramiv(prog, GL_LINK_STATUS, &val);
+  assert(val == GL_TRUE && "failed to link shader");
 
-  std::cout << "Link shader OK" << std::endl;
+  printf("Link shader OK\n");
 
   return true;
+}
+
+void
+reshapeFunc(GLFWwindow *window, int w, int h)
+{
+  (void)window;
+  int fb_w, fb_h;
+  glfwGetFramebufferSize(window, &fb_w, &fb_h);
+  glViewport(0, 0, fb_w, fb_h);
+  glMatrixMode(GL_PROJECTION);
+  glLoadIdentity();
+  gluPerspective(45.0, (float)w / (float)h, 0.1f, 1000.0f);
+  glMatrixMode(GL_MODELVIEW);
+  glLoadIdentity();
+
+  width = w;
+  height = h;
+}
+
+void
+clickFunc(GLFWwindow *window, int button, int action, int mods)
+{
+  if ((button == GLFW_MOUSE_BUTTON_LEFT)) {
+    if (action == GLFW_PRESS) {
+      mouseLeftPressed = true;
+      mouseRightPressed = false;
+    } else if (action == GLFW_RELEASE) {
+      mouseLeftPressed = false;
+    }
+  }
+  if ((button == GLFW_MOUSE_BUTTON_RIGHT)) {
+    if (action == GLFW_PRESS) {
+      mouseRightPressed = true;
+      mouseLeftPressed = false;
+    } else if (action == GLFW_RELEASE) {
+      mouseRightPressed = false;
+    }
+  }
+}
+
+void
+motionFunc(GLFWwindow *window, double mouse_x, double mouse_y)
+{
+  float transScale = 2.0f;
+
+  if (mouseLeftPressed) {
+    eye[0] += -transScale * (mouse_x - prevMouseX) / (float)width;
+    lookat[0] += -transScale * (mouse_x - prevMouseX) / (float)width;
+    eye[1] += transScale * (mouse_y - prevMouseY) / (float)height;
+    lookat[1] += transScale * (mouse_y - prevMouseY) / (float)height;
+  } else if (mouseRightPressed) {
+    eye[2] += transScale * (mouse_y - prevMouseY) / (float)height;
+    lookat[2] += transScale * (mouse_y - prevMouseY) / (float)height;
+  }
+
+  prevMouseX = mouse_x;
+  prevMouseY = mouse_y;
+}
+
+static void
+SetupMeshState(tinygltf::Model &model, GLuint progId)
+{
+  {
+    for (int i = 0; i < (int)model.bufferViews.size(); ++i) {
+      const tinygltf::BufferView &bufferView = model.bufferViews[i];
+      if (bufferView.target == 0) {
+        std::cout << "WARN: bufferView.target is zero" << std::endl;
+        continue;  // Unsupported bufferView.
+      }
+
+      int sparse_accessor = -1;
+      for (int a_i = 0; a_i < (int)model.accessors.size(); ++a_i) {
+        const auto &accessor = model.accessors[a_i];
+        if (accessor.bufferView == i) {
+          std::cout << i << " is used by accessor " << a_i << std::endl;
+          if (accessor.sparse.isSparse) {
+            std::cout << "TODO: support sparse_accessor" << std::endl;
+            sparse_accessor = a_i;
+            break;
+          }
+        }
+      }
+
+      const tinygltf::Buffer &buffer = model.buffers[bufferView.buffer];
+      GLBufferState state;
+      glGenBuffers(1, &state.vb);
+      glBindBuffer(bufferView.target, state.vb);
+      std::cout << "buffer.size= " << buffer.data.size()
+                << ", byteOffset = " << bufferView.byteOffset << std::endl;
+
+      if (sparse_accessor < 0)
+        glBufferData(bufferView.target, bufferView.byteLength,
+            &buffer.data.at(0) + bufferView.byteOffset, GL_STATIC_DRAW);
+      else {
+        std::cout << "TODO: support sparse_accessor" << std::endl;
+      }
+
+      glBindBuffer(bufferView.target, 0);
+
+      glBufferState[i] = state;
+    }
+  }
+
+  glUseProgram(progId);
+
+  glProgramState.attribs["POSITION"] = glGetAttribLocation(progId, "in_vertex");
+  glProgramState.attribs["NORMAL"] = glGetAttribLocation(progId, "in_normal");
+  glProgramState.attribs["TEXCOORD_0"] =
+      glGetAttribLocation(progId, "in_texcoord");
+};
+
+static void
+DrawMesh(tinygltf::Model &model, const tinygltf::Mesh &mesh)
+{
+  for (size_t i = 0; i < mesh.primitives.size(); i++) {
+    const tinygltf::Primitive &primitive = mesh.primitives[i];
+
+    if (primitive.indices < 0) return;
+
+    std::map<std::string, int>::const_iterator it(primitive.attributes.begin());
+    std::map<std::string, int>::const_iterator itEnd(
+        primitive.attributes.end());
+
+    for (; it != itEnd; it++) {
+      assert(it->second >= 0);
+      const tinygltf::Accessor &accessor = model.accessors[it->second];
+      glBindBuffer(GL_ARRAY_BUFFER, glBufferState[accessor.bufferView].vb);
+      checkErrors("bind buffer");
+      int size = 1;
+      if (accessor.type == TINYGLTF_TYPE_SCALAR) {
+        size = 1;
+      } else if (accessor.type == TINYGLTF_TYPE_VEC2) {
+        size = 2;
+      } else if (accessor.type == TINYGLTF_TYPE_VEC3) {
+        size = 3;
+      } else if (accessor.type == TINYGLTF_TYPE_VEC4) {
+        size = 4;
+      } else {
+        assert(0);
+      }
+      // it->first would be "POSITION", "NORMAL", "TEXCOORD_0", ...
+      if ((it->first.compare("POSITION") == 0) ||
+          (it->first.compare("NORMAL") == 0) ||
+          (it->first.compare("TEXCOORD_0") == 0)) {
+        if (glProgramState.attribs[it->first] >= 0) {
+          // Compute byteStride from Accessor + BufferView combination.
+          int byteStride =
+              accessor.ByteStride(model.bufferViews[accessor.bufferView]);
+          assert(byteStride != -1);
+          glVertexAttribPointer(glProgramState.attribs[it->first], size,
+              accessor.componentType, accessor.normalized ? GL_TRUE : GL_FALSE,
+              byteStride, BUFFER_OFFSET(accessor.byteOffset));
+          checkErrors("vertex attrib pointer");
+          glEnableVertexAttribArray(glProgramState.attribs[it->first]);
+          checkErrors("enable vertex attrib array");
+        }
+      }
+    }
+
+    const tinygltf::Accessor &indexAccessor =
+        model.accessors[primitive.indices];
+    glBindBuffer(
+        GL_ELEMENT_ARRAY_BUFFER, glBufferState[indexAccessor.bufferView].vb);
+    checkErrors("bind buffer");
+    int mode = -1;
+    if (primitive.mode == TINYGLTF_MODE_TRIANGLES) {
+      mode = GL_TRIANGLES;
+    } else if (primitive.mode == TINYGLTF_MODE_TRIANGLE_STRIP) {
+      mode = GL_TRIANGLE_STRIP;
+    } else if (primitive.mode == TINYGLTF_MODE_TRIANGLE_FAN) {
+      mode = GL_TRIANGLE_FAN;
+    } else if (primitive.mode == TINYGLTF_MODE_POINTS) {
+      mode = GL_POINTS;
+    } else if (primitive.mode == TINYGLTF_MODE_LINE) {
+      mode = GL_LINES;
+    } else if (primitive.mode == TINYGLTF_MODE_LINE_LOOP) {
+      mode = GL_LINE_LOOP;
+    } else {
+      assert(0);
+    }
+    glDrawElements(mode, indexAccessor.count, indexAccessor.componentType,
+        BUFFER_OFFSET(indexAccessor.byteOffset));
+    checkErrors("draw elements");
+
+    {
+      std::map<std::string, int>::const_iterator it(
+          primitive.attributes.begin());
+      std::map<std::string, int>::const_iterator itEnd(
+          primitive.attributes.end());
+
+      for (; it != itEnd; it++) {
+        if ((it->first.compare("POSITION") == 0) ||
+            (it->first.compare("NORMAL") == 0) ||
+            (it->first.compare("TEXCOORD_0") == 0)) {
+          if (glProgramState.attribs[it->first] >= 0) {
+            glDisableVertexAttribArray(glProgramState.attribs[it->first]);
+          }
+        }
+      }
+    }
+  }
+}
+
+// Hierarchically draw nodes
+static void
+DrawNode(tinygltf::Model &model, const tinygltf::Node &node)
+{
+  // Apply xform
+
+  glPushMatrix();
+  if (node.matrix.size() == 16) {
+    // Use `matrix' attribute
+    glMultMatrixd(node.matrix.data());
+  } else {
+    // Assume Trans x Rotate x Scale order
+    if (node.translation.size() == 3) {
+      // glTranslated(
+      // node.translation[0], node.translation[1], node.translation[2]);
+    }
+
+    if (node.rotation.size() == 4) {
+      std::cout << "TODO: support node rotation matrix" << std::endl;
+      // double angleDegrees;
+      // double axis[3];
+
+      // QuatToAngleAxis(node.rotation, angleDegrees, axis);
+
+      // glRotated(angleDegrees, axis[0], axis[1], axis[2]);
+    }
+
+    if (node.scale.size() == 3) {
+      glScaled(node.scale[0], node.scale[1], node.scale[2]);
+    }
+  }
+
+  // std::cout << "node " << node.name << ", Meshes " << node.meshes.size() <<
+  // std::endl;
+
+  // std::cout << it->first << std::endl;
+  // FIXME(syoyo): Refactor.
+  // DrawCurves(scene, it->second);
+  if (node.mesh > -1) {
+    assert(node.mesh < (int)model.meshes.size());
+    DrawMesh(model, model.meshes[node.mesh]);
+  }
+
+  // Draw child nodes.
+  for (size_t i = 0; i < node.children.size(); i++) {
+    assert(node.children[i] < (int)model.nodes.size());
+    DrawNode(model, model.nodes[node.children[i]]);
+  }
+
+  glPopMatrix();
+}
+
+static void
+DrawModel(tinygltf::Model &model)
+{
+  // If the glTF asset has at least one scene, and doesn't define a default one
+  // just show the first one we can find
+  assert(model.scenes.size() > 0);
+
+  int scene_to_display = model.defaultScene > -1 ? model.defaultScene : 0;
+  const tinygltf::Scene &scene = model.scenes[scene_to_display];
+  for (size_t i = 0; i < scene.nodes.size(); i++) {
+    DrawNode(model, model.nodes[scene.nodes[i]]);
+  }
+}
+
+static void
+Init()
+{
+  eye[0] = 0.0f;
+  eye[1] = 0.0f;
+  eye[2] = CAM_Z;
+
+  lookat[0] = 0.0f;
+  lookat[1] = 0.0f;
+  lookat[2] = 0.0f;
+
+  up[0] = 0.0f;
+  up[1] = 1.0f;
+  up[2] = 0.0f;
 }
 
 int
 main(int argc, char **argv)
 {
-  if (argc < 5) {
-    std::cout << "[HELP] gltf-viewer <model path>.gltf <binary path>.bin "
-                 "<vertex shader path>.glsl <fragment shader path>.glsl"
-              << std::endl;
-    return EXIT_FAILURE;
-  }
-
-  std::string gltf_path(argv[1]);
-  std::string binary_path(argv[2]);
-  std::string vertex_shader_path(argv[3]);
-  std::string fragment_shader_path(argv[4]);
-
-  tinygltf::TinyGLTF loader;
   tinygltf::Model model;
-
+  tinygltf::TinyGLTF loader;
   std::string err;
   std::string warn;
 
-  // globalになっているところ
-  std::map<int, GLuint> bufferViewMap;  // bufferViewIndex : Buffer
-  std::map<std::string, int>
-      attributeLocationMap;  // attribute : AttribLocation
+  if (argc < 2) {
+    std::cout << "glview input.gltf <scale>" << std::endl;
+    std::cout << "defaulting to example cube model" << std::endl;
+  }
 
-  bool result = false;
-  // TODO: support glb
-  result = loader.LoadASCIIFromFile(&model, &err, &warn, gltf_path.c_str());
-  if (!result) {
-    std::cerr << "[ERROR] Failed to load gltf: " << gltf_path << std::endl;
-    return EXIT_FAILURE;
+  std::string input_filename(argv[1]);
+
+  std::string ext = GetFilePathExtension(input_filename);
+
+  bool ret = false;
+  if (ext.compare("glb") == 0) {
+    // assume binary glTF.
+    ret =
+        loader.LoadBinaryFromFile(&model, &err, &warn, input_filename.c_str());
+  } else {
+    // assume ascii glTF.
+    ret = loader.LoadASCIIFromFile(&model, &err, &warn, input_filename.c_str());
   }
-  if (!err.empty()) {
-    std::cerr << "[ERROR] " << err << std::endl;
-    return EXIT_FAILURE;
-  }
+
   if (!warn.empty()) {
-    std::cout << "[WARN] " << warn << std::endl;
+    printf("Warn: %s\n", warn.c_str());
   }
+
+  if (!err.empty()) {
+    printf("ERR: %s\n", err.c_str());
+  }
+  if (!ret) {
+    printf("Failed to load .glTF : %s\n", argv[1]);
+    exit(-1);
+  }
+
+  Init();
 
   if (!glfwInit()) {
-    std::cerr << "Failed to initialize GLFW" << std::endl;
-    return EXIT_FAILURE;
+    std::cerr << "Failed to initialize GLFW." << std::endl;
+    return -1;
   }
 
-  int width = 500;
-  int height = 500;
-  std::string title = "glTF viewer";
-  GLFWwindow *window =
-      glfwCreateWindow(width, height, title.c_str(), NULL, NULL);
+  window = glfwCreateWindow(width, height, "glTF Viewer", NULL, NULL);
   if (window == NULL) {
-    std::cerr << "Failed to open GLFW window." << std::endl;
+    std::cerr << "Failed to open GLFW window. " << std::endl;
+    glfwTerminate();
+    return 1;
   }
 
   glfwGetWindowSize(window, &width, &height);
+
   glfwMakeContextCurrent(window);
 
+  glfwSetMouseButtonCallback(window, clickFunc);
+  glfwSetCursorPosCallback(window, motionFunc);
+
+  glewExperimental = true;  // This may be only true for linux environment.
   if (glewInit() != GLEW_OK) {
     std::cerr << "Failed to initialize GLEW." << std::endl;
-    return EXIT_FAILURE;
+    return -1;
   }
 
-  GLuint vertexId = 0, fragmentId = 0, programId = 0;
+  GLuint vertId = 0, fragId = 0, progId = 0;
 
-  if (!loadShader(GL_VERTEX_SHADER, vertexId, vertex_shader_path.c_str()))
-    return EXIT_FAILURE;
+  const char *shader_frag_filename = "shader.frag";
+  const char *shader_vert_filename = "shader.vert";
 
-  if (!loadShader(GL_FRAGMENT_SHADER, fragmentId, fragment_shader_path.c_str()))
-    return EXIT_FAILURE;
-
-  if (!linkShader(programId, vertexId, fragmentId)) return EXIT_FAILURE;
-
-  glUseProgram(programId);
-
-  if (setupBuffers(model, programId, bufferViewMap, attributeLocationMap)) {
-    std::cerr << "Failed to generate buffers." << std::endl;
-    return EXIT_FAILURE;
+  if (false == LoadShader(GL_VERTEX_SHADER, vertId, shader_vert_filename)) {
+    return -1;
   }
+  checkErrors("load vert shader");
+
+  if (false == LoadShader(GL_FRAGMENT_SHADER, fragId, shader_frag_filename)) {
+    return -1;
+  }
+  checkErrors("load frag shader");
+
+  if (false == LinkShader(progId, vertId, fragId)) {
+    return -1;
+  }
+
+  checkErrors("link");
+
+  {
+    // At least `in_vertex` should be used in the shader.
+    GLint vtxLoc = glGetAttribLocation(progId, "in_vertex");
+    if (vtxLoc < 0) {
+      printf("vertex loc not found.\n");
+      exit(-1);
+    }
+  }
+
+  glUseProgram(progId);
+  checkErrors("useProgram");
+
+  SetupMeshState(model, progId);
+  checkErrors("SetupGLState");
 
   while (glfwWindowShouldClose(window) == GL_FALSE) {
     glfwPollEvents();
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
     glEnable(GL_DEPTH_TEST);
 
-    // render
-    drawModel(model, bufferViewMap, attributeLocationMap);
+    glViewport(0, 0, width, height);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    gluPerspective(45.0, (float)width / (float)height, 0.1f, 1000.0f);
+    glPushMatrix();
+    gluLookAt(eye[0], eye[1], eye[2], lookat[0], lookat[1], lookat[2], up[0],
+        up[1], up[2]);
+
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+
+    DrawModel(model);
+
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
 
     glFlush();
+
     glfwSwapBuffers(window);
   }
 
   glfwTerminate();
-  return EXIT_SUCCESS;
 }

@@ -17,5 +17,13 @@ $ ninja -C build
 
 ## run
 ```
-$ ./build/gltf-viewer <model path>.gltf <binary path>.bin <vertex shader path>.glsl <fragment shader path>.glsl
+$ ./build/gltf-viewer <model path>.gltf <binary path>.bin
+```
+
+## examples
+```
+$ ./build/gltf-viewer ./assets/Cube/Cube.gltf ./assets/Cube/Cube.bin
+```
+```
+$ ./build/gltf-viewer ./assets/Duck/Duck.gltf ./assets/Duck/Duck0.bin
 ```
