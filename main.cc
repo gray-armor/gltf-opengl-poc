@@ -91,7 +91,6 @@ loadShader(GLenum shaderType, GLuint &shader, const char *shaderSourceFilename)
     GLsizei msglen;
     glGetShaderInfoLog(shader, 4096, &msglen, log);
     printf("%s\n", log);
-    // assert(val == GL_TRUE && "failed to compile shader");
     printf(
         "ERR: Failed to load or compile shader [ %s ]\n", shaderSourceFilename);
     return false;
@@ -301,7 +300,6 @@ drawMesh(tinygltf::Model &model, const tinygltf::Mesh &mesh)
   }
 }
 
-// Hierarchically draw nodes
 static void
 drawNode(tinygltf::Model &model, const tinygltf::Node &node)
 {
